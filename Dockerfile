@@ -1,4 +1,4 @@
-# Node 20 על דביאן רזה
+# Node 20 על Debian רזה
 FROM node:20-slim
 
 # התקנת ffmpeg
@@ -8,17 +8,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
 # תקיית עבודה
 WORKDIR /app
 
-# התקנת תלויות (production בלבד)
+# התקנת תלויות (production) – בלי לדרוש package-lock.json
 COPY package*.json ./
-RUN npm ci --omit=dev
+RUN npm install --omit=dev
 
 # העתקת שאר הקוד
 COPY . .
 
-# Render מספק PORT; נדאג שהאפליקציה תאזין עליו
+# משתני סביבה
 ENV NODE_ENV=production
-# אפשר להשאיר את PORT ללא ערך קשיח; האפליקציה קוראת process.env.PORT
-# ENV PORT=10000
 
 # הרצה
 CMD ["npm", "start"]
