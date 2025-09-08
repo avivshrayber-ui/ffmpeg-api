@@ -1,12 +1,14 @@
 {
-  "name": "ffmpeg-composer",
+  "name": "ffmpeg-api",
+  "version": "1.0.0",
+  "description": "Simple FFmpeg API on Node.js for Render",
+  "main": "server.js",
   "type": "module",
-  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
   "dependencies": {
-    "express": "^4.19.2",
-    "ffmpeg-static": "^5.2.0",
-    "fluent-ffmpeg": "^2.1.2",
-    "node-fetch": "^3.3.2",
-    "tmp": "^0.2.3"
+    "express": "^4.19.2"
   }
 }
