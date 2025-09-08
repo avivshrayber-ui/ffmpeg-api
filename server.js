@@ -1,65 +1,141 @@
 import express from "express";
 import { exec } from "child_process";
+import { promisify } from "util";
 import { randomUUID } from "crypto";
-import fs from "fs";
+import fs from "fs/promises";
+import { v2 as cloudinary } from "cloudinary";
+
+const sh = promisify(exec);
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "20mb" }));
 
-// Health check
-app.get("/healthz", (req, res) => res.json({ ok: true }));
-
-// Compose videos
-app.post("/compose", async (req, res) => {
-  const { ugcUrl, show1Url, show2Url } = req.body;
-
-  if (!ugcUrl || !show1Url) {
-    return res.status(400).json({
-      error: "You must provide ugcUrl and show1Url (show2Url optional).",
-    });
-  }
-
-  const id = randomUUID();
-  const outFile = `/tmp/out_${id}.mp4`; // Render allows /tmp storage
-
-  // === FFmpeg filter ===
-  // - UGC full video + alternating overlays (show1, show2, show1, …) every 7s, 2s long each
-  const filter = `
-[0:v]scale=720:1280,fps=30,format=yuv420p[base];
-[1:v]scale=720:1280,format=rgba,trim=0:2,setpts=PTS-STARTPTS,
-fade=t=in:st=0:d=0.5:alpha=1,
-fade=t=out:st=1.5:d=0.5:alpha=1[p1];
-${show2Url ? "[2:v]scale=720:1280,format=rgba,trim=0:2,setpts=PTS-STARTPTS,fade=t=in:st=0:d=0.5:alpha=1,fade=t=out:st=1.5:d=0.5:alpha=1[p2];" : ""}
-[base][p1]overlay=eof_action=pass:enable='between(t,7,8.99)'[tmp1]
-${show2Url ? ";[tmp1][p2]overlay=eof_action=pass:enable='between(t,14,15.99)'[v]" : ""}
-  `.replace(/\s+/g, " "); // compact
-
-  // === FFmpeg command ===
-  const inputs = [
-    `-i "${ugcUrl}"`,
-    `-i "${show1Url}"`,
-    show2Url ? `-i "${show2Url}"` : "",
-  ].join(" ");
-
-  const cmd = `ffmpeg -y ${inputs} -filter_complex "${filter}" -map "[v]" -map 0:a -c:v libx264 -r 30 -pix_fmt yuv420p -c:a aac -b:a 128k ${outFile}`;
-
-  console.log("Running:", cmd);
-
-  exec(cmd, { maxBuffer: 1024 * 1024 * 20 }, (err, stdout, stderr) => {
-    if (err) {
-      console.error("FFmpeg error:", stderr);
-      return res.status(500).json({ error: "FFmpeg failed", details: stderr });
-    }
-
-    // For test: just return a static file path
-    // On Render, you could later serve it via S3 / Cloudinary upload
-    res.json({
-      message: "Video composed successfully",
-      file: outFile,
-    });
-  });
+// Cloudinary config from env
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key:    process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// Start server
+// health
+app.get("/healthz", (_, res) => res.json({ ok: true }));
+
+/**
+ * POST /compose
+ * body: {
+ *   ugcUrl, show1Url, show2Url,
+ *   firstAt=7, secondAt=14, lengthSec=3, fadeSec=0.5,
+ *   width=720, height=1280, fps=30,
+ *   folder="ugc-pipeline", publicIdPrefix optional
+ * }
+ */
+app.post("/compose", async (req, res) => {
+  try {
+    const {
+      ugcUrl,
+      show1Url,
+      show2Url,
+      firstAt = 7,
+      secondAt = 14,
+      lengthSec = 3,
+      fadeSec = 0.5,
+      width = 720,
+      height = 1280,
+      fps = 30,
+      folder = "ugc-pipeline",
+      publicIdPrefix = ""
+    } = req.body || {};
+
+    if (!ugcUrl || !show1Url || !show2Url) {
+      return res.status(400).json({
+        error: "Missing ugcUrl/show1Url/show2Url",
+      });
+    }
+
+    // 1) probe duration of UGC (directly from URL)
+    const { stdout: durStr } = await sh(
+      `ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 "${ugcUrl}"`
+    );
+    const duration = Math.max(0, parseFloat((durStr || "").trim()) || 0);
+    if (!duration || !isFinite(duration)) {
+      return res.status(400).json({ error: "Could not read UGC duration" });
+    }
+
+    // last overlay should sit flush to the end
+    const lastStart = Math.max(0, duration - lengthSec);
+    const fadeOutStart = +(lengthSec - fadeSec).toFixed(3);
+
+    // 2) build filter_complex
+    // full screen overlays, alpha fade in/out, scheduled at t=firstAt, secondAt, lastStart
+    const filter = [
+      `[0:v]scale=${width}:${height},format=yuv420p[base]`,
+
+      `[1:v]scale=${width}:${height},format=rgba,trim=0:${lengthSec},setpts=PTS-STARTPTS,` +
+      `fade=t=in:st=0:d=${fadeSec}:alpha=1,fade=t=out:st=${fadeOutStart}:d=${fadeSec}:alpha=1,` +
+      `setpts=PTS+${firstAt}/TB[s1]`,
+
+      `[2:v]scale=${width}:${height},format=rgba,trim=0:${lengthSec},setpts=PTS-STARTPTS,` +
+      `fade=t=in:st=0:d=${fadeSec}:alpha=1,fade=t=out:st=${fadeOutStart}:d=${fadeSec}:alpha=1,` +
+      `setpts=PTS+${secondAt}/TB[s2]`,
+
+      // use show1 again as the final closer
+      `[1:v]scale=${width}:${height},format=rgba,trim=0:${lengthSec},setpts=PTS-STARTPTS,` +
+      `fade=t=in:st=0:d=${fadeSec}:alpha=1,fade=t=out:st=${fadeOutStart}:d=${fadeSec}:alpha=1,` +
+      `setpts=PTS+${lastStart.toFixed(3)}/TB[s3]`,
+
+      `[base][s1]overlay=eof_action=pass[o1]`,
+      `[o1][s2]overlay=eof_action=pass[o2]`,
+      `[o2][s3]overlay=eof_action=pass[v]`,
+    ].join(";");
+
+    // 3) run ffmpeg (inputs are URLs, output to /tmp)
+    const id = randomUUID();
+    const outFile = `/tmp/final_${id}.mp4`;
+
+    const ffmpegCmd = `
+      ffmpeg -y \
+        -i "${ugcUrl}" \
+        -i "${show1Url}" \
+        -i "${show2Url}" \
+        -filter_complex "${filter}" \
+        -map "[v]" -map 0:a \
+        -c:v libx264 -r ${fps} -pix_fmt yuv420p \
+        -c:a aac -b:a 128k \
+        "${outFile}"
+    `.replace(/\s+/g, " ").trim();
+
+    console.log("FFmpeg CMD:", ffmpegCmd);
+    const { stderr } = await sh(ffmpegCmd, { maxBuffer: 1024 * 1024 * 50 });
+    console.log("FFmpeg done\n", stderr?.slice(-2000) || "");
+
+    // 4) upload to Cloudinary (video resource)
+    const publicId =
+      (publicIdPrefix ? `${publicIdPrefix}_` : "") + id.slice(0, 8);
+    const up = await cloudinary.uploader.upload(outFile, {
+      resource_type: "video",
+      folder: `${folder}/${new Date().toISOString().slice(0,10)}`,
+      public_id: publicId,
+      overwrite: true,
+    });
+
+    // 5) cleanup
+    try { await fs.unlink(outFile); } catch {}
+
+    // 6) respond with public URL
+    return res.json({
+      ok: true,
+      video_url: up.secure_url,
+      public_id: up.public_id,
+      duration,
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({
+      error: "compose_failed",
+      details: String(err?.message || err),
+    });
+  }
+});
+
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`FFmpeg API listening on :${PORT}`));
