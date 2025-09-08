@@ -1,14 +1,13 @@
 {
   "name": "ffmpeg-api",
   "version": "1.0.0",
-  "description": "Simple FFmpeg API on Node.js for Render",
-  "main": "server.js",
   "type": "module",
+  "private": true,
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
+    "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "cloudinary": "^2.5.1"
   }
 }
