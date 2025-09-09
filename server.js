@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 import { exec } from "child_process";
 import { promisify } from "util";
@@ -7,9 +8,11 @@ import { v2 as cloudinary } from "cloudinary";
 
 const sh = promisify(exec);
 const app = express();
+
+// גוף בקשות JSON
 app.use(express.json({ limit: "20mb" }));
 
-// ---------- Cloudinary ----------
+// ---------- Cloudinary (ENV ב-Render) ----------
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key:    process.env.CLOUDINARY_API_KEY,
@@ -21,6 +24,7 @@ app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
 // ---------- Helpers ----------
 async function probeDuration(url) {
+  // מחזיר משך וידאו אמיתי בשניות כ-float
   const { stdout } = await sh(
     `ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 "${url}"`
   );
@@ -30,9 +34,8 @@ async function probeDuration(url) {
 }
 
 function uniqSorted(arr) {
-  const out = [...new Set(arr.map(x => +(+x).toFixed(3)))];
-  out.sort((a, b) => a - b);
-  return out;
+  const set = new Set(arr.map(x => +(+x).toFixed(3)));
+  return Array.from(set).sort((a, b) => a - b);
 }
 
 // ---------- Main ----------
@@ -42,7 +45,7 @@ function uniqSorted(arr) {
  * {
  *   ugcUrl (required),
  *   show1Url (required),
- *   show2Url (optional),
+ *   show2Url (optional, fallback to show1),
  *   interval=7,
  *   insertLen=3,
  *   fadeSec=0.5,
@@ -52,11 +55,12 @@ function uniqSorted(arr) {
  * }
  */
 app.post("/compose", async (req, res) => {
+  const startedAt = Date.now();
   try {
     const {
       ugcUrl,
       show1Url,
-      show2Url,                // optional; if missing -> reuse show1Url
+      show2Url,                // אם לא קיים – נשתמש שוב ב-show1Url
       interval = 7,
       insertLen = 3,
       fadeSec = 0.5,
@@ -71,84 +75,69 @@ app.post("/compose", async (req, res) => {
       return res.status(400).json({ error: "Missing ugcUrl/show1Url" });
     }
 
-    // 1) actual duration
+    // 1) משך אמיתי של ה-UGC
     const duration = await probeDuration(ugcUrl);
 
-    // 2) start times: every N sec + a final one flush to end
-    const starts = [];
-    let t = interval;
-    while (t < duration - insertLen) {
-      starts.push(+t.toFixed(3));
-      t += interval;
+    // 2) נקודות הזרקה: כל interval שניות + עוד אחת צמוד לסוף
+    const points = [];
+    for (let t = interval; t < duration - insertLen; t += interval) {
+      points.push(+t.toFixed(3));
     }
-    const lastStart = Math.max(0, duration - insertLen);
-    starts.push(+lastStart.toFixed(3));
+    points.push(+(Math.max(0, duration - insertLen)).toFixed(3));
+    const starts = uniqSorted(points);
 
-    const startTimes = uniqSorted(starts);
-
-    // 3) build filter_complex
-    // base video
+    // 3) בונים filter_complex
+    const fadeOutStart = +(insertLen - fadeSec).toFixed(3);
     const parts = [];
+
+    // בסיס (וידאו) – האודיו ימופה מהקלט 0
     parts.push(`[0:v]scale=${width}:${height},fps=${fps},format=yuv420p[base]`);
 
-    // prepare sc1out & sc2out (with alpha fades)
-    const fadeOutStart = +(insertLen - fadeSec).toFixed(3);
-
+    // הכנת שני ה-showcases עם alpha fade
     parts.push(
       `[1:v]scale=${width}:${height},format=rgba,trim=0:${insertLen},setpts=PTS-STARTPTS,` +
-      `fade=t=in:st=0:d=${fadeSec}:alpha=1,` +
-      `fade=t=out:st=${fadeOutStart}:d=${fadeSec}:alpha=1[sc1out]`
+      `fade=t=in:st=0:d=${fadeSec}:alpha=1,fade=t=out:st=${fadeOutStart}:d=${fadeSec}:alpha=1[sc1out]`
     );
 
     const sc2Input = show2Url ? "[2:v]" : "[1:v]";
     parts.push(
       `${sc2Input}scale=${width}:${height},format=rgba,trim=0:${insertLen},setpts=PTS-STARTPTS,` +
-      `fade=t=in:st=0:d=${fadeSec}:alpha=1,` +
-      `fade=t=out:st=${fadeOutStart}:d=${fadeSec}:alpha=1[sc2out]`
+      `fade=t=in:st=0:d=${fadeSec}:alpha=1,fade=t=out:st=${fadeOutStart}:d=${fadeSec}:alpha=1[sc2out]`
     );
 
-    // how many times each overlay is used (alternate sc1, sc2, sc1, ...)
-    const totalOverlays = startTimes.length;
-    const countSc1 = Math.ceil(totalOverlays / 2); // indices 0,2,4,...
-    const countSc2 = Math.floor(totalOverlays / 2); // indices 1,3,5,...
+    // כמה פעמים כל showcase נדרש (לשימוש חוזר – split)
+    const totalOverlays = starts.length;
+    const needSc1 = Math.ceil(totalOverlays / 2);  // אינדקסים 0,2,4...
+    const needSc2 = Math.floor(totalOverlays / 2); // אינדקסים 1,3,5...
 
-    // split sc1out/sc2out if needed (to reuse the same prepared clip multiple times)
-    // labels: sc1_1..sc1_n ; sc2_1..sc2_n
-    if (countSc1 > 1) {
-      const labels = Array.from({ length: countSc1 }, (_, i) => `[sc1_${i + 1}]`).join("");
-      parts.push(`[sc1out]split=${countSc1}${labels}`);
+    if (needSc1 > 1) {
+      const labels = Array.from({ length: needSc1 }, (_, i) => `[sc1_${i+1}]`).join("");
+      parts.push(`[sc1out]split=${needSc1}${labels}`);
     }
-    if (countSc2 > 1) {
-      const labels = Array.from({ length: countSc2 }, (_, i) => `[sc2_${i + 1}]`).join("");
-      parts.push(`[sc2out]split=${countSc2}${labels}`);
+    if (needSc2 > 1) {
+      const labels = Array.from({ length: needSc2 }, (_, i) => `[sc2_${i+1}]`).join("");
+      parts.push(`[sc2out]split=${needSc2}${labels}`);
     }
 
-    // helper to get label by index
-    const getSc1Label = (k) => (countSc1 > 1 ? `sc1_${k}` : `sc1out`);
-    const getSc2Label = (k) => (countSc2 > 1 ? `sc2_${k}` : `sc2out`);
+    const getSc1 = (k) => (needSc1 > 1 ? `sc1_${k}` : `sc1out`);
+    const getSc2 = (k) => (needSc2 > 1 ? `sc2_${k}` : `sc2out`);
 
-    // overlay chain: [base] -> [tmp1] -> ... -> [v]
+    // overlay chain: base -> tmp1 -> tmp2 -> ... -> v
     let cur = "base";
     let used1 = 0;
     let used2 = 0;
-
-    startTimes.forEach((st, i) => {
+    starts.forEach((st, i) => {
       const en = +(st + insertLen - 0.01).toFixed(3);
-      const next = (i === startTimes.length - 1) ? "v" : `tmp${i + 1}`;
-
+      const next = (i === starts.length - 1) ? "v" : `tmp${i + 1}`;
       if (i % 2 === 0) {
-        // sc1
         used1 += 1;
-        const ov = getSc1Label(used1);
         parts.push(
-          `[${cur}][${ov}]overlay=eof_action=pass:enable='between(t,${st},${en})'[${next}]`
+          `[${cur}][${getSc1(used1)}]overlay=eof_action=pass:enable='between(t,${st},${en})'[${next}]`
         );
       } else {
-        // sc2
         used2 += 1;
-        const ov = getSc2Label(used2);
         parts.push(
-          `[${cur}][${ov}]overlay=eof_action=pass:enable='between(t,${st},${en})'[${next}]`
+          `[${cur}][${getSc2(used2)}]overlay=eof_action=pass:enable='between(t,${st},${en})'[${next}]`
         );
       }
       cur = next;
@@ -156,10 +145,11 @@ app.post("/compose", async (req, res) => {
 
     const filter = parts.join(";");
 
-    // 4) run ffmpeg (inputs via URLs; output to /tmp)
+    // 4) הרצת ffmpeg (URLs כקלט; פלט ל-/tmp)
     const id = randomUUID().slice(0, 8);
     const outFile = `/tmp/final_${id}.mp4`;
 
+    // אם אין show2Url, נטען את show1 פעמיים כדי לשמור על מבנה קבוע של פילטרים
     const inputs = show2Url
       ? `-i "${ugcUrl}" -i "${show1Url}" -i "${show2Url}"`
       : `-i "${ugcUrl}" -i "${show1Url}" -i "${show1Url}"`;
@@ -176,28 +166,57 @@ app.post("/compose", async (req, res) => {
     console.log("==== FFmpeg filter_complex ====\n" + filter + "\n===============================");
     console.log("FFmpeg CMD:", cmd);
 
-    const { stderr } = await sh(cmd, { maxBuffer: 1024 * 1024 * 200 });
-    console.log("FFmpeg done. tail logs:\n", (stderr || "").slice(-1500));
+    // הגדלת buffer ללוגים
+    let ffmpegStdout = "";
+    let ffmpegStderr = "";
+    try {
+      const { stdout, stderr } = await sh(cmd, { maxBuffer: 1024 * 1024 * 200 });
+      ffmpegStdout = stdout || "";
+      ffmpegStderr = stderr || "";
+    } catch (e) {
+      // במקרה של כשל – נחזיר את הלוגים במלואם כדי שתראה ב-N8N
+      return res.status(500).json({
+        error: "ffmpeg_failed",
+        details: (e && e.message) || "unknown",
+        filter_complex: filter,
+        cmd,
+        stderr: e?.stderr ? String(e.stderr).slice(-4000) : "",
+        stdout: e?.stdout ? String(e.stdout).slice(-1000) : ""
+      });
+    }
 
-    // 5) upload to Cloudinary
+    // 5) העלאה ל-Cloudinary
     const publicId = `${publicIdPrefix ? publicIdPrefix + "_" : ""}${id}`;
-    const up = await cloudinary.uploader.upload(outFile, {
-      resource_type: "video",
-      folder: `${folder}/${new Date().toISOString().slice(0, 10)}`,
-      public_id: publicId,
-      overwrite: true,
-    });
+    let up;
+    try {
+      up = await cloudinary.uploader.upload(outFile, {
+        resource_type: "video",
+        folder: `${folder}/${new Date().toISOString().slice(0, 10)}`,
+        public_id: publicId,
+        overwrite: true,
+      });
+    } catch (e) {
+      // החזר שגיאת העלאה + tail לוגים
+      return res.status(500).json({
+        error: "cloudinary_upload_failed",
+        details: e?.message || String(e),
+        duration,
+        filter_complex: filter,
+        cmd,
+        ffmpeg_stderr_tail: String(ffmpegStderr).slice(-1500)
+      });
+    } finally {
+      try { await fs.unlink(outFile); } catch {}
+    }
 
-    // 6) cleanup
-    try { await fs.unlink(outFile); } catch {}
-
-    // 7) response
+    // 6) תשובה
     return res.json({
       ok: true,
       video_url: up.secure_url,
       public_id: up.public_id,
       duration,
-      starts: startTimes
+      starts,
+      elapsed_ms: Date.now() - startedAt
     });
 
   } catch (err) {
@@ -209,5 +228,6 @@ app.post("/compose", async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 10000;
+// ---------- Start ----------
+const PORT = process.env.PORT || 10000; // חשוב ל-Render
 app.listen(PORT, () => console.log(`FFmpeg API listening on :${PORT}`));
