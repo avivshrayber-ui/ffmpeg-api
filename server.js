@@ -5,26 +5,37 @@ import { promisify } from "util";
 import { randomUUID } from "crypto";
 import fs from "fs/promises";
 import { v2 as cloudinary } from "cloudinary";
+// For local testing with .env file (not strictly needed on Render if ENV vars are set directly)
+import 'dotenv/config';
+
+// In Node.js 18+ (which your Dockerfile with node:20-slim uses), 'fetch' is globally available.
+// If you were using an older Node.js version, you might need: import fetch from 'node-fetch';
+// and add "node-fetch": "^3.3.2" to your package.json dependencies.
 
 const sh = promisify(exec);
 const app = express();
 
-// גוף בקשות JSON
+// A simple in-memory store for job statuses.
+// IMPORTANT: In a production environment, this should be replaced with a a persistent store
+// (e.g., Redis, PostgreSQL) to survive server restarts or multiple instances, and allow scaling.
+const inMemoryJobs = {};
+
+// Parse JSON request bodies
 app.use(express.json({ limit: "20mb" }));
 
-// ---------- Cloudinary (ENV ב-Render) ----------
+// ---------- Cloudinary Configuration (ENV in Render) ----------
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key:    process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// ---------- Health ----------
+// ---------- Health Check Endpoint ----------
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
-// ---------- Helpers ----------
+// ---------- Helper Functions ----------
 async function probeDuration(url) {
-  // מחזיר משך וידאו אמיתי בשניות כ-float
+  // Returns real video duration in seconds as a float
   const { stdout } = await sh(
     `ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 "${url}"`
   );
@@ -38,29 +49,54 @@ function uniqSorted(arr) {
   return Array.from(set).sort((a, b) => a - b);
 }
 
-// ---------- Main ----------
-/**
- * POST /compose
- * body:
- * {
- *   ugcUrl (required),
- *   show1Url (required),
- *   show2Url (optional, fallback to show1),
- *   interval=7,
- *   insertLen=3,
- *   fadeSec=0.5,
- *   width=720, height=1280, fps=30,
- *   folder="ugc-pipeline",
- *   publicIdPrefix=""
- * }
- */
-app.post("/compose", async (req, res) => {
+// Function to send a callback to N8N or any other specified URL
+async function sendCallback(callbackUrl, payload) {
+  if (!callbackUrl) {
+    console.log(`[Job ${payload?.jobId || 'UNKNOWN'}] No callback URL provided for this job. Skipping callback.`);
+    return;
+  }
+
+  const controller = new AbortController();
+  // Set a timeout for the callback request (e.g., 10 seconds)
+  const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+  try {
+    console.log(`[Job ${payload?.jobId || 'UNKNOWN'}] Sending callback to ${callbackUrl} with payload:`, JSON.stringify(payload));
+    const response = await fetch(callbackUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal // Link abort controller to fetch request
+    });
+    clearTimeout(timeoutId); // Clear the timeout if fetch completes in time
+
+    if (!response.ok) {
+      console.error(`[Job ${payload?.jobId || 'UNKNOWN'}] Callback to ${callbackUrl} failed with status ${response.status}: ${await response.text()}`);
+    } else {
+      console.log(`[Job ${payload?.jobId || 'UNKNOWN'}] Callback to ${callbackUrl} successful.`);
+    }
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      console.error(`[Job ${payload?.jobId || 'UNKNOWN'}] Callback to ${callbackUrl} timed out after 10 seconds.`);
+    } else {
+      console.error(`[Job ${payload?.jobId || 'UNKNOWN'}] Error sending callback to ${callbackUrl}:`, error);
+    }
+  } finally {
+    clearTimeout(timeoutId); // Ensure timeout is cleared even on other errors
+  }
+}
+
+// ---------- Main processing logic (now in a separate, non-blocking function) ----------
+async function processVideoJob(jobId, jobData, callbackUrl) {
   const startedAt = Date.now();
+  // Update job status in memory
+  inMemoryJobs[jobId] = { status: "processing", progress: 0, startedAt, ...jobData };
+
   try {
     const {
       ugcUrl,
       show1Url,
-      show2Url,                // אם לא קיים – נשתמש שוב ב-show1Url
+      show2Url,
       interval = 7,
       insertLen = 3,
       fadeSec = 0.5,
@@ -69,46 +105,46 @@ app.post("/compose", async (req, res) => {
       fps = 30,
       folder = "ugc-pipeline",
       publicIdPrefix = ""
-    } = req.body || {};
+    } = jobData;
 
-    if (!ugcUrl || !show1Url) {
-      return res.status(400).json({ error: "Missing ugcUrl/show1Url" });
-    }
+    console.log(`[Job ${jobId}] Starting video processing...`);
+    inMemoryJobs[jobId].progress = 10; // Update progress
 
-    // 1) משך אמיתי של ה-UGC
+    // 1) Get UGC duration
     const duration = await probeDuration(ugcUrl);
+    console.log(`[Job ${jobId}] UGC duration: ${duration}s`);
+    inMemoryJobs[jobId].progress = 20;
 
-    // 2) נקודות הזרקה: כל interval שניות + עוד אחת צמוד לסוף
+    // 2) Calculate insertion points
     const points = [];
     for (let t = interval; t < duration - insertLen; t += interval) {
       points.push(+t.toFixed(3));
     }
     points.push(+(Math.max(0, duration - insertLen)).toFixed(3));
     const starts = uniqSorted(points);
+    console.log(`[Job ${jobId}] Insert points:`, starts);
+    inMemoryJobs[jobId].progress = 30;
 
-    // 3) בונים filter_complex
+    // 3) Build filter_complex string
     const fadeOutStart = +(insertLen - fadeSec).toFixed(3);
     const parts = [];
 
-    // בסיס (וידאו) – האודיו ימופה מהקלט 0
     parts.push(`[0:v]scale=${width}:${height},fps=${fps},format=yuv420p[base]`);
 
-    // הכנת שני ה-showcases עם alpha fade
     parts.push(
       `[1:v]scale=${width}:${height},format=rgba,trim=0:${insertLen},setpts=PTS-STARTPTS,` +
       `fade=t=in:st=0:d=${fadeSec}:alpha=1,fade=t=out:st=${fadeOutStart}:d=${fadeSec}:alpha=1[sc1out]`
     );
 
-    const sc2Input = show2Url ? "[2:v]" : "[1:v]";
+    const sc2Input = show2Url ? "[2:v]" : "[1:v]"; // Use show1 if show2 is not provided
     parts.push(
       `${sc2Input}scale=${width}:${height},format=rgba,trim=0:${insertLen},setpts=PTS-STARTPTS,` +
       `fade=t=in:st=0:d=${fadeSec}:alpha=1,fade=t=out:st=${fadeOutStart}:d=${fadeSec}:alpha=1[sc2out]`
     );
 
-    // כמה פעמים כל showcase נדרש (לשימוש חוזר – split)
     const totalOverlays = starts.length;
-    const needSc1 = Math.ceil(totalOverlays / 2);  // אינדקסים 0,2,4...
-    const needSc2 = Math.floor(totalOverlays / 2); // אינדקסים 1,3,5...
+    const needSc1 = Math.ceil(totalOverlays / 2);
+    const needSc2 = Math.floor(totalOverlays / 2);
 
     if (needSc1 > 1) {
       const labels = Array.from({ length: needSc1 }, (_, i) => `[sc1_${i+1}]`).join("");
@@ -122,7 +158,6 @@ app.post("/compose", async (req, res) => {
     const getSc1 = (k) => (needSc1 > 1 ? `sc1_${k}` : `sc1out`);
     const getSc2 = (k) => (needSc2 > 1 ? `sc2_${k}` : `sc2out`);
 
-    // overlay chain: base -> tmp1 -> tmp2 -> ... -> v
     let cur = "base";
     let used1 = 0;
     let used2 = 0;
@@ -145,11 +180,9 @@ app.post("/compose", async (req, res) => {
 
     const filter = parts.join(";");
 
-    // 4) הרצת ffmpeg (URLs כקלט; פלט ל-/tmp)
-    const id = randomUUID().slice(0, 8);
-    const outFile = `/tmp/final_${id}.mp4`;
+    // 4) Execute ffmpeg
+    const outFile = `/tmp/final_${jobId}.mp4`;
 
-    // אם אין show2Url, נטען את show1 פעמיים כדי לשמור על מבנה קבוע של פילטרים
     const inputs = show2Url
       ? `-i "${ugcUrl}" -i "${show1Url}" -i "${show2Url}"`
       : `-i "${ugcUrl}" -i "${show1Url}" -i "${show1Url}"`;
@@ -163,55 +196,85 @@ app.post("/compose", async (req, res) => {
         "${outFile}"
     `.replace(/\s+/g, " ").trim();
 
-    console.log("==== FFmpeg filter_complex ====\n" + filter + "\n===============================");
-    console.log("FFmpeg CMD:", cmd);
+    console.log(`[Job ${jobId}] ==== FFmpeg filter_complex ====\n` + filter + "\n===============================");
+    console.log(`[Job ${jobId}] FFmpeg CMD:`, cmd);
+    inMemoryJobs[jobId].progress = 50;
 
-    // הגדלת buffer ללוגים
     let ffmpegStdout = "";
     let ffmpegStderr = "";
     try {
-      const { stdout, stderr } = await sh(cmd, { maxBuffer: 1024 * 1024 * 200 });
+      console.log(`[Job ${jobId}] Executing FFmpeg command...`);
+      const { stdout, stderr } = await sh(cmd, { maxBuffer: 1024 * 1024 * 200 }); // Increased buffer for logs
       ffmpegStdout = stdout || "";
       ffmpegStderr = stderr || "";
+      console.log(`[Job ${jobId}] FFmpeg command completed.`);
+      inMemoryJobs[jobId].progress = 80;
     } catch (e) {
-      // במקרה של כשל – נחזיר את הלוגים במלואם כדי שתראה ב-N8N
-      return res.status(500).json({
+      console.error(`[Job ${jobId}] FFmpeg command failed:`, e);
+      // Update job status and send callback on failure
+      inMemoryJobs[jobId] = {
+        ...inMemoryJobs[jobId],
+        status: "failed",
         error: "ffmpeg_failed",
         details: (e && e.message) || "unknown",
         filter_complex: filter,
         cmd,
         stderr: e?.stderr ? String(e.stderr).slice(-4000) : "",
         stdout: e?.stdout ? String(e.stdout).slice(-1000) : ""
-      });
+      };
+      await sendCallback(callbackUrl, { jobId, status: "failed", error: inMemoryJobs[jobId].error, details: inMemoryJobs[jobId].details, cmd });
+      return; // Exit as FFmpeg failed
     }
 
-    // 5) העלאה ל-Cloudinary
-    const publicId = `${publicIdPrefix ? publicIdPrefix + "_" : ""}${id}`;
+    // 5) Upload to Cloudinary
+    const publicId = `${publicIdPrefix ? publicIdPrefix + "_" : ""}${jobId}`;
     let up;
     try {
+      console.log(`[Job ${jobId}] Uploading to Cloudinary...`);
       up = await cloudinary.uploader.upload(outFile, {
         resource_type: "video",
         folder: `${folder}/${new Date().toISOString().slice(0, 10)}`,
         public_id: publicId,
         overwrite: true,
       });
+      console.log(`[Job ${jobId}] Cloudinary upload complete. URL: ${up.secure_url}`);
+      inMemoryJobs[jobId].progress = 95;
     } catch (e) {
-      // החזר שגיאת העלאה + tail לוגים
-      return res.status(500).json({
+      console.error(`[Job ${jobId}] Cloudinary upload failed:`, e);
+      // Update job status and send callback on failure
+      inMemoryJobs[jobId] = {
+        ...inMemoryJobs[jobId],
+        status: "failed",
         error: "cloudinary_upload_failed",
         details: e?.message || String(e),
         duration,
         filter_complex: filter,
         cmd,
         ffmpeg_stderr_tail: String(ffmpegStderr).slice(-1500)
-      });
+      };
+      await sendCallback(callbackUrl, { jobId, status: "failed", error: inMemoryJobs[jobId].error, details: inMemoryJobs[jobId].details, cmd });
+      return; // Exit as Cloudinary upload failed
     } finally {
-      try { await fs.unlink(outFile); } catch {}
+      // Always attempt to delete the temporary file
+      try { await fs.unlink(outFile); console.log(`[Job ${jobId}] Deleted temporary file: ${outFile}`); } catch (e) { console.warn(`[Job ${jobId}] Failed to delete temp file: ${outFile}`, e); }
     }
 
-    // 6) תשובה
-    return res.json({
-      ok: true,
+    // 6) Job completed successfully
+    inMemoryJobs[jobId] = {
+      ...inMemoryJobs[jobId],
+      status: "completed",
+      progress: 100,
+      video_url: up.secure_url,
+      public_id: up.public_id,
+      duration,
+      starts,
+      elapsed_ms: Date.now() - startedAt
+    };
+    console.log(`[Job ${jobId}] Video processing completed successfully. Elapsed: ${inMemoryJobs[jobId].elapsed_ms}ms`);
+    // Send success callback
+    await sendCallback(callbackUrl, {
+      jobId,
+      status: "completed",
       video_url: up.secure_url,
       public_id: up.public_id,
       duration,
@@ -220,14 +283,95 @@ app.post("/compose", async (req, res) => {
     });
 
   } catch (err) {
-    console.error("compose_failed:", err);
-    return res.status(500).json({
+    console.error(`[Job ${jobId}] compose_failed:`, err);
+    // Catch any unexpected errors during job processing
+    inMemoryJobs[jobId] = {
+      ...inMemoryJobs[jobId],
+      status: "failed",
       error: "compose_failed",
       details: String(err?.message || err)
-    });
+    };
+    await sendCallback(callbackUrl, { jobId, status: "failed", error: inMemoryJobs[jobId].error, details: inMemoryJobs[jobId].details });
   }
+}
+
+// ---------- Main API Endpoint (now returns immediately) ----------
+/**
+ * POST /compose
+ * body:
+ * {
+ *   ugcUrl (required),
+ *   show1Url (required),
+ *   show2Url (optional, fallback to show1),
+ *   interval=7,
+ *   insertLen=3,
+ *   fadeSec=0.5,
+ *   width=720, height=1280, fps=30,
+ *   folder="ugc-pipeline",
+ *   publicIdPrefix="",
+ *   callbackUrl (optional) - URL for the server to POST results back to N8N
+ * }
+ */
+app.post("/compose", (req, res) => { // This function is no longer 'async' and responds immediately
+  const jobId = randomUUID().slice(0, 8);
+  const { ugcUrl, show1Url, callbackUrl, ...otherBodyParams } = req.body || {};
+
+  if (!ugcUrl || !show1Url) {
+    return res.status(400).json({ error: "Missing ugcUrl/show1Url" });
+  }
+
+  // Store the initial job request data and status
+  inMemoryJobs[jobId] = {
+    status: "queued",
+    submittedAt: Date.now(),
+    ugcUrl,
+    show1Url,
+    callbackUrl, // Store callback URL for the background process
+    ...otherBodyParams
+  };
+
+  console.log(`Received new job request. Job ID: ${jobId}. Kicking off background process.`);
+
+  // Kick off the long-running process without awaiting it.
+  // This allows the current HTTP request to return immediately.
+  processVideoJob(jobId, req.body, callbackUrl)
+    .catch(err => {
+      // This catch handles errors that might occur *during* the initial kickoff of processVideoJob
+      console.error(`Error during initial background job kickoff for job ${jobId}:`, err);
+      // Ensure job status is marked as failed
+      inMemoryJobs[jobId] = {
+        ...inMemoryJobs[jobId],
+        status: "failed",
+        error: "initial_background_kickoff_error",
+        details: String(err?.message || err)
+      };
+      // Attempt to send callback even for wrapper errors
+      sendCallback(callbackUrl, { jobId, status: "failed", error: "initial_background_kickoff_error", details: String(err?.message || err) });
+    });
+
+  // Immediately send a 202 Accepted response.
+  // N8N will receive this response quickly, preventing timeouts.
+  // The actual result will be sent via the callbackUrl or can be polled via /status/:jobId
+  return res.status(202).json({
+    ok: true,
+    message: "Video composition job started. Awaiting completion callback.",
+    jobId: jobId,
+    status_url: `/status/${jobId}` // Optional: for polling the job status
+  });
 });
 
-// ---------- Start ----------
-const PORT = process.env.PORT || 10000; // חשוב ל-Render
+// Optional: Endpoint for N8N to check job status (if callbacks are not used or as a fallback)
+app.get("/status/:jobId", (req, res) => {
+  const { jobId } = req.params;
+  const job = inMemoryJobs[jobId];
+
+  if (!job) {
+    return res.status(404).json({ error: "Job not found" });
+  }
+  return res.json(job);
+});
+
+
+// ---------- Start Server ----------
+const PORT = process.env.PORT || 10000; // Important for Render to use process.env.PORT
 app.listen(PORT, () => console.log(`FFmpeg API listening on :${PORT}`));
