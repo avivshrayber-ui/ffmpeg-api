@@ -8,6 +8,9 @@
   },
   "dependencies": {
     "cloudinary": "^2.5.1",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "dotenv": "^16.4.5"
+    // If 'fetch' is not globally available in your environment (unlikely with Node 20),
+    // you might need "node-fetch": "^3.3.2"
   }
 }
