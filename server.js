@@ -6,27 +6,35 @@ import fs from "fs/promises";
 import { v2 as cloudinary } from "cloudinary";
 
 const sh = promisify(exec);
-
 const app = express();
 app.use(express.json({ limit: "20mb" }));
 
-// Cloudinary config from env
+// --- Cloudinary config (מ־Environment Variables ב-Render) ---
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key:    process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// health
+// --- Health & env checks ---
 app.get("/healthz", (_, res) => res.json({ ok: true }));
+app.get("/env", (_, res) =>
+  res.json({
+    cloud_name: !!process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: !!process.env.CLOUDINARY_API_KEY,
+    api_secret: !!process.env.CLOUDINARY_API_SECRET,
+  })
+);
 
 /**
  * POST /compose
- * body: {
- *   ugcUrl, show1Url, show2Url,
- *   firstAt=7, secondAt=14, lengthSec=3, fadeSec=0.5,
+ * body JSON:
+ * {
+ *   ugcUrl, show1Url, show2Url,      // חובה: ugcUrl, show1Url; show2Url אופציונלי
+ *   firstAt=7, secondAt=14,          // שניות
+ *   lengthSec=3, fadeSec=0.5,        // משך כל overlay + זמן fade
  *   width=720, height=1280, fps=30,
- *   folder="ugc-pipeline", publicIdPrefix optional
+ *   folder="ugc-pipeline", publicIdPrefix=""   // לאחסון בענן
  * }
  */
 app.post("/compose", async (req, res) => {
@@ -34,7 +42,7 @@ app.post("/compose", async (req, res) => {
     const {
       ugcUrl,
       show1Url,
-      show2Url,
+      show2Url,                 // אם לא קיים – נשתמש ב-show1 פעמיים
       firstAt = 7,
       secondAt = 14,
       lengthSec = 3,
@@ -46,13 +54,11 @@ app.post("/compose", async (req, res) => {
       publicIdPrefix = ""
     } = req.body || {};
 
-    if (!ugcUrl || !show1Url || !show2Url) {
-      return res.status(400).json({
-        error: "Missing ugcUrl/show1Url/show2Url",
-      });
+    if (!ugcUrl || !show1Url) {
+      return res.status(400).json({ error: "Missing ugcUrl/show1Url" });
     }
 
-    // 1) probe duration of UGC (directly from URL)
+    // 1) משך ה-UGC (ישירות מה-URL)
     const { stdout: durStr } = await sh(
       `ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 "${ugcUrl}"`
     );
@@ -61,79 +67,76 @@ app.post("/compose", async (req, res) => {
       return res.status(400).json({ error: "Could not read UGC duration" });
     }
 
-    // last overlay should sit flush to the end
+    // overlay נסגר יפה על סוף הוידאו
     const lastStart = Math.max(0, duration - lengthSec);
     const fadeOutStart = +(lengthSec - fadeSec).toFixed(3);
 
-    // 2) build filter_complex
-    // full screen overlays, alpha fade in/out, scheduled at t=firstAt, secondAt, lastStart
-    const filter = [
+    // 2) בניית filter_complex
+    // בסיס: ה-UGC בסקייל מלא; שלוש שכבות: s1 @firstAt, s2 @secondAt (או s1 אם אין show2), s3 @end ( תמיד show1 ).
+    const filterParts = [
       `[0:v]scale=${width}:${height},format=yuv420p[base]`,
 
       `[1:v]scale=${width}:${height},format=rgba,trim=0:${lengthSec},setpts=PTS-STARTPTS,` +
-      `fade=t=in:st=0:d=${fadeSec}:alpha=1,fade=t=out:st=${fadeOutStart}:d=${fadeSec}:alpha=1,` +
-      `setpts=PTS+${firstAt}/TB[s1]`,
+        `fade=t=in:st=0:d=${fadeSec}:alpha=1,fade=t=out:st=${fadeOutStart}:d=${fadeSec}:alpha=1,` +
+        `setpts=PTS+${firstAt}/TB[s1]`,
 
-      `[2:v]scale=${width}:${height},format=rgba,trim=0:${lengthSec},setpts=PTS-STARTPTS,` +
-      `fade=t=in:st=0:d=${fadeSec}:alpha=1,fade=t=out:st=${fadeOutStart}:d=${fadeSec}:alpha=1,` +
-      `setpts=PTS+${secondAt}/TB[s2]`,
+      `${show2Url ? `[2:v]` : `[1:v]`}scale=${width}:${height},format=rgba,trim=0:${lengthSec},setpts=PTS-STARTPTS,` +
+        `fade=t=in:st=0:d=${fadeSec}:alpha=1,fade=t=out:st=${fadeOutStart}:d=${fadeSec}:alpha=1,` +
+        `setpts=PTS+${secondAt}/TB[s2]`,
 
-      // use show1 again as the final closer
       `[1:v]scale=${width}:${height},format=rgba,trim=0:${lengthSec},setpts=PTS-STARTPTS,` +
-      `fade=t=in:st=0:d=${fadeSec}:alpha=1,fade=t=out:st=${fadeOutStart}:d=${fadeSec}:alpha=1,` +
-      `setpts=PTS+${lastStart.toFixed(3)}/TB[s3]`,
+        `fade=t=in:st=0:d=${fadeSec}:alpha=1,fade=t=out:st=${fadeOutStart}:d=${fadeSec}:alpha=1,` +
+        `setpts=PTS+${lastStart.toFixed(3)}/TB[s3]`,
 
       `[base][s1]overlay=eof_action=pass[o1]`,
       `[o1][s2]overlay=eof_action=pass[o2]`,
       `[o2][s3]overlay=eof_action=pass[v]`,
-    ].join(";");
+    ];
+    const filter = filterParts.join(";");
 
-    // 3) run ffmpeg (inputs are URLs, output to /tmp)
-    const id = randomUUID();
+    // 3) הרצת ffmpeg (קלטים = URLs; פלט לקובץ זמני ב-/tmp)
+    const id = randomUUID().slice(0, 8);
     const outFile = `/tmp/final_${id}.mp4`;
 
+    const inputs = show2Url
+      ? `-i "${ugcUrl}" -i "${show1Url}" -i "${show2Url}"`
+      : `-i "${ugcUrl}" -i "${show1Url}" -i "${show1Url}"`;
+
     const ffmpegCmd = `
-      ffmpeg -y \
-        -i "${ugcUrl}" \
-        -i "${show1Url}" \
-        -i "${show2Url}" \
-        -filter_complex "${filter}" \
-        -map "[v]" -map 0:a \
-        -c:v libx264 -r ${fps} -pix_fmt yuv420p \
-        -c:a aac -b:a 128k \
+      ffmpeg -y ${inputs}
+        -filter_complex "${filter}"
+        -map "[v]" -map 0:a
+        -c:v libx264 -r ${fps} -pix_fmt yuv420p
+        -c:a aac -b:a 128k
         "${outFile}"
     `.replace(/\s+/g, " ").trim();
 
     console.log("FFmpeg CMD:", ffmpegCmd);
-    const { stderr } = await sh(ffmpegCmd, { maxBuffer: 1024 * 1024 * 50 });
-    console.log("FFmpeg done\n", stderr?.slice(-2000) || "");
+    const { stderr } = await sh(ffmpegCmd, { maxBuffer: 1024 * 1024 * 80 });
+    console.log("FFmpeg done. tail logs:\n", (stderr || "").slice(-1500));
 
-    // 4) upload to Cloudinary (video resource)
-    const publicId =
-      (publicIdPrefix ? `${publicIdPrefix}_` : "") + id.slice(0, 8);
+    // 4) העלאה ל-Cloudinary כ-VIDEO
+    const publicId = `${publicIdPrefix ? publicIdPrefix + "_" : ""}${id}`;
     const up = await cloudinary.uploader.upload(outFile, {
       resource_type: "video",
-      folder: `${folder}/${new Date().toISOString().slice(0,10)}`,
+      folder: `${folder}/${new Date().toISOString().slice(0, 10)}`,
       public_id: publicId,
       overwrite: true,
     });
 
-    // 5) cleanup
+    // 5) ניקוי קובץ זמני
     try { await fs.unlink(outFile); } catch {}
 
-    // 6) respond with public URL
+    // 6) תשובה
     return res.json({
       ok: true,
       video_url: up.secure_url,
       public_id: up.public_id,
-      duration,
+      duration
     });
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({
-      error: "compose_failed",
-      details: String(err?.message || err),
-    });
+    console.error("compose_failed:", err);
+    return res.status(500).json({ error: "compose_failed", details: String(err?.message || err) });
   }
 });
 
