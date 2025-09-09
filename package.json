@@ -1,13 +1,13 @@
 {
   "name": "ffmpeg-api",
   "version": "1.0.0",
-  "main": "server.js",
   "type": "module",
+  "private": true,
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "cloudinary": "^2.5.0",
+    "cloudinary": "^2.5.1",
     "express": "^4.19.2"
   }
 }
